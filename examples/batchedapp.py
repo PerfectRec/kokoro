@@ -104,10 +104,10 @@ def load_model():
 @app.function(
     image=image,
     gpu=gpu_list,
-    scaledown_window=10,
+    scaledown_window=300,
     timeout=1200,
     min_containers=0,
-    max_containers=20,
+    max_containers=1,
 )
 @modal.fastapi_endpoint(method="POST", route="/generate")
 @modal.concurrent(max_inputs=2)

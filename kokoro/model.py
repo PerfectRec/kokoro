@@ -146,7 +146,8 @@ class KModel(torch.nn.Module):
         speeds: torch.FloatTensor
     ) -> Tuple[List[torch.FloatTensor], List[torch.LongTensor]]:
         """
-        Batched forward pass for multiple inputs.
+        Batched forward pass for multiple inputs using true batching.
+        Optimized for GPU - all operations fully parallelized.
         
         Args:
             input_ids: Padded batch of input token IDs [batch_size, max_length]
@@ -178,48 +179,67 @@ class KModel(torch.nn.Module):
         # Prosody prediction
         d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
         x, _ = self.predictor.lstm(d)
-        duration = self.predictor.duration_proj(x)
         
         # Duration prediction with speed adjustment
-        duration = torch.sigmoid(duration).sum(axis=-1) / speeds.unsqueeze(1)
-        pred_dur = torch.round(duration).clamp(min=1).long()
+        attention_mask = (~text_mask).float()
+        duration = self.predictor.duration_proj(x)
+        pred_dur = torch.round(
+            ((torch.sigmoid(duration)).sum(dim=-1).clamp(min=1) * attention_mask) / speeds.unsqueeze(1)
+        ).long()
         
-        # Process each item in the batch
+        # Calculate sequence lengths after duration expansion
+        seq_lengths = pred_dur.sum(axis=-1)
+        max_frames = seq_lengths.max().item()
+        
+        # Create batched alignment matrices using the kokoro_batch approach
+        # This is the key to true batching - creates all alignments at once
+        frame_indices = torch.arange(max_frames, device=device).view(1, 1, -1)  # [1, 1, max_frames]
+        duration_cumsum = pred_dur.cumsum(dim=1).unsqueeze(-1)  # [batch, seq_len, 1]
+        
+        # Create masks for alignment
+        mask1 = duration_cumsum > frame_indices  # [batch, seq_len, max_frames]
+        mask2 = frame_indices >= torch.cat(
+            [torch.zeros(batch_size, 1, 1, device=device), duration_cumsum[:, :-1, :]],
+            dim=1
+        )  # [batch, seq_len, max_frames]
+        
+        pred_aln_trgs = (mask1 & mask2).float()  # [batch, seq_len, max_frames]
+        
+        # Expand features to frame level using batched alignment - ALL AT ONCE!
+        en = d.transpose(-1, -2) @ pred_aln_trgs  # [batch, channels, max_frames]
+        
+        # Text encoding - batched
+        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
+        asr = t_en @ pred_aln_trgs  # [batch, channels, max_frames]
+        
+        # Create frame mask for padded positions
+        frame_mask = (frame_indices.squeeze(1).expand(batch_size, -1) >= seq_lengths.unsqueeze(1)).to(device)
+        frame_mask = (~frame_mask).float()  # [batch, max_frames]
+        
+        # F0 and N prediction - now batched!
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
+        
+        # Decode audio - batched
+        audio_batch = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
+        
+        # Extract individual audios based on their actual lengths
         audio_list = []
         pred_dur_list = []
         
         for i in range(batch_size):
-            seq_len = input_lengths[i].item()
-            item_input_ids = input_ids[i:i+1, :seq_len]
-            item_pred_dur = pred_dur[i, :seq_len]
-            item_ref_s = ref_s[i:i+1]
+            # Calculate actual audio length for this item
+            frame_len = seq_lengths[i].item()
+            # The decoder upsamples by a factor, need to calculate actual audio samples
+            audio_len = int(frame_len * (audio_batch.shape[-1] / max_frames))
             
-            # Create alignment for this item
-            indices = torch.repeat_interleave(torch.arange(seq_len, device=device), item_pred_dur)
-            pred_aln_trg = torch.zeros((seq_len, indices.shape[0]), device=device)
-            pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
-            pred_aln_trg = pred_aln_trg.unsqueeze(0)
-            
-            # Get encoded features for this item - d is [batch, max_len, channels]
-            item_d = d[i:i+1, :seq_len, :]  # [1, seq_len, channels]
-            en = item_d.transpose(-1, -2) @ pred_aln_trg  # [1, channels, seq_len] @ [1, seq_len, aligned] = [1, channels, aligned]
-            
-            # F0 and N prediction
-            F0_pred, N_pred = self.predictor.F0Ntrain(en, s[i:i+1])
-            
-            # Text encoding
-            item_text_mask = text_mask[i:i+1, :seq_len]
-            item_input_length = input_lengths[i:i+1]
-            t_en = self.text_encoder(item_input_ids, item_input_length, item_text_mask)
-            
-            # ASR alignment
-            asr = t_en @ pred_aln_trg
-            
-            # Decode audio
-            item_audio = self.decoder(asr, F0_pred, N_pred, item_ref_s[:, :128]).squeeze()
+            # Extract audio for this item (trim padding)
+            if batch_size == 1:
+                item_audio = audio_batch[:audio_len]
+            else:
+                item_audio = audio_batch[i, :audio_len]
             
             audio_list.append(item_audio.cpu())
-            pred_dur_list.append(item_pred_dur.cpu())
+            pred_dur_list.append(pred_dur[i, :input_lengths[i]].cpu())
         
         return audio_list, pred_dur_list
 
