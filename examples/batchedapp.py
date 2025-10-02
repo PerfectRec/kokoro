@@ -1,30 +1,15 @@
 import modal
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
-from pathlib import Path
 
-# Get the parent directory (kokoro root)
-kokoro_root = Path(__file__).parent.parent
-
-# Define the image with local kokoro code
+# Define the image - install kokoro from GitHub
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "huggingface_hub",
-        "loguru", 
-        "misaki[en]>=0.9.4",
-        "numpy",
-        "torch",
-        "transformers",
-        "scipy",
+        "git+https://github.com/PerfectRec/kokoro.git",
         "fastapi[standard]"
     )
     .apt_install(["espeak-ng", "ffmpeg"])
-    # Copy local kokoro package into the container
-    .copy_local_dir(
-        local_path=str(kokoro_root / "kokoro"),
-        remote_path="/root/kokoro"
-    )
 )
 
 # Create the Modal app
@@ -71,9 +56,6 @@ model = None
 
 # Load model function
 def load_model():
-    import sys
-    sys.path.insert(0, "/root")
-    
     from kokoro import KPipeline, KModel
 
     model = KModel(repo_id="hexgrad/Kokoro-82M").to("cuda:0").eval()
@@ -357,6 +339,6 @@ async def health_check():
     return {"status": "healthy", "batching": "enabled"}
 
 
-# To run the ephemeral endpoint: modal serve examples/modal_batched.py
-# To deploy: modal deploy examples/modal_batched.py
+# To run the ephemeral endpoint: modal serve examples/batchedapp.py
+# To deploy: modal deploy examples/batchedapp.py
 

@@ -1,6 +1,6 @@
 from kokoro import KPipeline, KModel
 import torch
-from scipy.io import wavfile
+import soundfile as sf
 
 def save_audio(audio: torch.Tensor, filename: str):
     """Helper function to save audio tensor as WAV file"""
@@ -8,11 +8,11 @@ def save_audio(audio: torch.Tensor, filename: str):
         # Ensure audio is on CPU and in the right format
         audio_cpu = audio.cpu().numpy()
         
-        # Save using scipy.io.wavfile
-        wavfile.write(
+        # Save using soundfile (cleaner than scipy)
+        sf.write(
             filename,
-            24000,  # Kokoro uses 24kHz sample rate
-            audio_cpu
+            audio_cpu,
+            24000  # Kokoro uses 24kHz sample rate
         )
         print(f"Audio saved as '{filename}'")
     else:

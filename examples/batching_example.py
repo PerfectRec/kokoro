@@ -4,7 +4,7 @@ Benchmark batching performance with larger text blocks (~300 characters each).
 """
 
 import time
-import scipy.io.wavfile as wavfile
+import soundfile as sf
 from kokoro import KPipeline
 import os
 
@@ -33,7 +33,7 @@ LARGE_TEXTS = [
 
 def save_audio(audio, filename, sample_rate=24000):
     """Save audio tensor to WAV file."""
-    wavfile.write(filename, sample_rate, audio.numpy())
+    sf.write(filename, audio.numpy(), sample_rate)
 
 def benchmark_sequential(pipeline, texts, voice, output_dir):
     """Benchmark sequential processing."""
