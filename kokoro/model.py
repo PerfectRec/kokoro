@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from transformers import AlbertConfig
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 import json
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 class KModel(torch.nn.Module):
     '''
@@ -135,6 +136,92 @@ class KModel(torch.nn.Module):
         pred_dur = pred_dur.cpu() if pred_dur is not None else None
         logger.debug(f"pred_dur: {pred_dur}")
         return self.Output(audio=audio, pred_dur=pred_dur) if return_output else audio
+
+    @torch.no_grad()
+    def forward_batch(
+        self,
+        input_ids: torch.LongTensor,
+        input_lengths: torch.LongTensor,
+        ref_s: torch.FloatTensor,
+        speeds: torch.FloatTensor
+    ) -> Tuple[List[torch.FloatTensor], List[torch.LongTensor]]:
+        """
+        Batched forward pass for multiple inputs.
+        
+        Args:
+            input_ids: Padded batch of input token IDs [batch_size, max_length]
+            input_lengths: Actual length of each sequence [batch_size]
+            ref_s: Voice embeddings for each item [batch_size, style_dim]
+            speeds: Speed factors for each item [batch_size]
+        
+        Returns:
+            Tuple of (audio_list, pred_dur_list) where each is a list of tensors
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Ensure input_lengths and speeds are on the correct device
+        input_lengths = input_lengths.to(device)
+        speeds = speeds.to(device)
+        
+        # Create text masks
+        text_mask = torch.arange(input_lengths.max(), device=device).unsqueeze(0).expand(batch_size, -1)
+        text_mask = torch.gt(text_mask + 1, input_lengths.unsqueeze(1)).to(device)
+        
+        # BERT encoding
+        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
+        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+        
+        # Style processing
+        s = ref_s[:, 128:]
+        
+        # Prosody prediction
+        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = self.predictor.lstm(d)
+        duration = self.predictor.duration_proj(x)
+        
+        # Duration prediction with speed adjustment
+        duration = torch.sigmoid(duration).sum(axis=-1) / speeds.unsqueeze(1)
+        pred_dur = torch.round(duration).clamp(min=1).long()
+        
+        # Process each item in the batch
+        audio_list = []
+        pred_dur_list = []
+        
+        for i in range(batch_size):
+            seq_len = input_lengths[i].item()
+            item_input_ids = input_ids[i:i+1, :seq_len]
+            item_pred_dur = pred_dur[i, :seq_len]
+            item_ref_s = ref_s[i:i+1]
+            
+            # Create alignment for this item
+            indices = torch.repeat_interleave(torch.arange(seq_len, device=device), item_pred_dur)
+            pred_aln_trg = torch.zeros((seq_len, indices.shape[0]), device=device)
+            pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
+            pred_aln_trg = pred_aln_trg.unsqueeze(0)
+            
+            # Get encoded features for this item - d is [batch, max_len, channels]
+            item_d = d[i:i+1, :seq_len, :]  # [1, seq_len, channels]
+            en = item_d.transpose(-1, -2) @ pred_aln_trg  # [1, channels, seq_len] @ [1, seq_len, aligned] = [1, channels, aligned]
+            
+            # F0 and N prediction
+            F0_pred, N_pred = self.predictor.F0Ntrain(en, s[i:i+1])
+            
+            # Text encoding
+            item_text_mask = text_mask[i:i+1, :seq_len]
+            item_input_length = input_lengths[i:i+1]
+            t_en = self.text_encoder(item_input_ids, item_input_length, item_text_mask)
+            
+            # ASR alignment
+            asr = t_en @ pred_aln_trg
+            
+            # Decode audio
+            item_audio = self.decoder(asr, F0_pred, N_pred, item_ref_s[:, :128]).squeeze()
+            
+            audio_list.append(item_audio.cpu())
+            pred_dur_list.append(item_pred_dur.cpu())
+        
+        return audio_list, pred_dur_list
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):

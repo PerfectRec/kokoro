@@ -148,6 +148,9 @@ class DurationEncoder(nn.Module):
     def forward(self, x, style, text_lengths, m):
         masks = m
         x = x.permute(2, 0, 1)
+        # Squeeze singleton dimension if present for batching compatibility
+        if style.dim() == 4:
+            style = style.squeeze(2)
         s = style.expand(x.shape[0], x.shape[1], -1)
         x = torch.cat([x, s], axis=-1)
         x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)

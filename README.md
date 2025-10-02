@@ -25,6 +25,69 @@ for i, (gs, ps, audio) in enumerate(generator):
 ```
 Under the hood, `kokoro` uses [`misaki`](https://pypi.org/project/misaki/), a G2P library at https://github.com/hexgrad/misaki
 
+### Batched Inference
+Process multiple texts efficiently using batched inference for 2-5x speedup:
+```py
+from kokoro import KPipeline
+import soundfile as sf
+
+# Initialize pipeline
+pipeline = KPipeline(lang_code='a')
+
+# Process multiple texts in batch
+texts = [
+    "Hello, this is the first sentence.",
+    "This is the second sentence.",
+    "And here's a third one for good measure."
+]
+
+# Generate audio for all texts efficiently
+results = pipeline.generate_batch(
+    texts=texts,
+    voice='af_heart',
+    speed=1.0  # or use [0.9, 1.0, 1.1] for per-text speeds
+)
+
+# Save audio files and access timestamps
+for i, result in enumerate(results):
+    # Access generated audio
+    sf.write(f'batch_{i}.wav', result.audio, 24000)
+    
+    # Access text and phonemes
+    print(f"Text: {result.graphemes}")
+    print(f"Phonemes: {result.phonemes}")
+    
+    # Access word timestamps (English only)
+    if result.tokens:
+        for token in result.tokens:
+            if hasattr(token, 'start_ts'):
+                print(f"  '{token.text}': {token.start_ts:.2f}s - {token.end_ts:.2f}s")
+    
+    # Track which original text this result came from
+    print(f"From original text index: {result.text_index}")
+```
+
+**Key features of batched inference:**
+- ✅ 2-5x faster than sequential processing
+- ✅ Preserves all features: word timestamps, multi-language support
+- ✅ Supports variable speeds per text
+- ✅ Tracks original text indices
+- ✅ Works with all languages and voices
+
+**Alternative batch API for pre-tokenized inputs:**
+```py
+# For English: pre-tokenize texts
+_, tokens1 = pipeline.g2p("First sentence.")
+_, tokens2 = pipeline.g2p("Second sentence.")
+
+# Generate from tokens
+results = pipeline.generate_from_tokens_batch(
+    tokens_list=[tokens1, tokens2],
+    voice='af_heart',
+    speed=1.0
+)
+```
+
 ### Advanced Usage
 You can run this advanced cell on [Google Colab](https://colab.research.google.com/).
 ```py

@@ -7,6 +7,7 @@ from typing import Callable, Generator, List, Optional, Tuple, Union
 import re
 import torch
 import os
+from torch.nn.utils.rnn import pad_sequence
 
 ALIASES = {
     'en-us': 'a',
@@ -329,6 +330,55 @@ class KPipeline:
             right = left + space_dur
             i = j + (1 if t.whitespace else 0)
 
+    def prepare_batch_params(
+        self,
+        phonemes_list: List[str],
+        voice: Union[str, torch.FloatTensor],
+        speed: Union[float, List[float]] = 1.0
+    ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.FloatTensor, torch.FloatTensor]:
+        """
+        Prepare batch parameters for batched inference.
+        
+        Args:
+            phonemes_list: List of phoneme strings
+            voice: Voice name or voice tensor (will be broadcast to all items)
+            speed: Single speed or list of speeds (one per item)
+        
+        Returns:
+            Tuple of (input_ids, input_lengths, voice_packs, speeds)
+        """
+        pack = self.load_voice(voice).to(self.model.device) if self.model else None
+        
+        # Convert phonemes to input IDs and collect voice embeddings
+        input_ids_list = []
+        voice_list = []
+        
+        for ps in phonemes_list:
+            ids = list(filter(lambda i: i is not None, map(lambda p: self.model.vocab.get(p), ps)))
+            input_ids_list.append(torch.LongTensor([0, *ids, 0]))
+            # Select voice embedding based on phoneme length (same as original infer method)
+            # Squeeze to remove the middle dimension: [1, 256] -> [256]
+            voice_embedding = pack[len(ps) - 1] if len(ps) > 0 else pack[0]
+            voice_list.append(voice_embedding.squeeze(0))
+        
+        # Calculate lengths
+        input_lengths = torch.LongTensor([len(ids) for ids in input_ids_list])
+        
+        # Pad sequences
+        input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=0).to(self.model.device)
+        
+        # Stack voice embeddings for batch
+        voice_packs = torch.stack(voice_list).to(self.model.device)
+        
+        # Prepare speeds
+        batch_size = len(phonemes_list)
+        if isinstance(speed, (int, float)):
+            speeds = torch.FloatTensor([speed] * batch_size)
+        else:
+            speeds = torch.FloatTensor(speed)
+        
+        return input_ids, input_lengths, voice_packs, speeds
+
     @dataclass
     class Result:
         graphemes: str
@@ -440,3 +490,199 @@ class KPipeline:
                         
                     output = KPipeline.infer(model, ps, pack, speed) if model else None
                     yield self.Result(graphemes=chunk, phonemes=ps, output=output, text_index=graphemes_index)
+
+    def generate_from_tokens_batch(
+        self,
+        tokens_list: List[List[en.MToken]],
+        voice: str,
+        speed: Union[float, List[float]] = 1.0,
+        model: Optional[KModel] = None
+    ) -> List['KPipeline.Result']:
+        """
+        Generate audio from a batch of pre-processed token lists.
+        
+        Args:
+            tokens_list: List of token lists (one per text)
+            voice: The voice to use for synthesis
+            speed: Single speed or list of speeds (one per item)
+            model: Optional KModel instance (uses pipeline's model if not provided)
+        
+        Returns:
+            List of KPipeline.Result objects with audio and timestamps
+        """
+        model = model or self.model
+        if not model:
+            raise ValueError('No model available for batch generation')
+        if voice is None:
+            raise ValueError('Specify a voice: pipeline.generate_from_tokens_batch(..., voice="af_heart")')
+        
+        # Process each token list through en_tokenize
+        all_chunks = []
+        chunk_to_input = []  # Track which input each chunk belongs to
+        
+        for input_idx, tokens in enumerate(tokens_list):
+            for gs, ps, tks in self.en_tokenize(tokens):
+                if not ps:
+                    continue
+                if len(ps) > 510:
+                    logger.warning(f"Truncating phoneme sequence: {len(ps)} > 510")
+                    ps = ps[:510]
+                all_chunks.append((gs, ps, tks))
+                chunk_to_input.append(input_idx)
+        
+        if not all_chunks:
+            return []
+        
+        # Prepare batch parameters
+        phonemes_list = [ps for _, ps, _ in all_chunks]
+        input_ids, input_lengths, voice_packs, speeds = self.prepare_batch_params(
+            phonemes_list, voice, speed if isinstance(speed, float) else 
+            [speed[chunk_to_input[i]] for i in range(len(all_chunks))]
+        )
+        
+        # Run batched inference
+        audio_list, pred_dur_list = model.forward_batch(
+            input_ids, input_lengths, voice_packs, speeds
+        )
+        
+        # Create results with timestamps
+        results = []
+        for i, ((gs, ps, tks), audio, pred_dur) in enumerate(zip(all_chunks, audio_list, pred_dur_list)):
+            output = KModel.Output(audio=audio, pred_dur=pred_dur)
+            if tks and pred_dur is not None:
+                KPipeline.join_timestamps(tks, pred_dur)
+            results.append(self.Result(
+                graphemes=gs,
+                phonemes=ps,
+                tokens=tks,
+                output=output,
+                text_index=chunk_to_input[i]
+            ))
+        
+        return results
+
+    def generate_batch(
+        self,
+        texts: List[str],
+        voice: str,
+        speed: Union[float, List[float]] = 1.0,
+        split_pattern: Optional[str] = r'\n+',
+        model: Optional[KModel] = None
+    ) -> List['KPipeline.Result']:
+        """
+        Generate audio from a batch of texts efficiently.
+        
+        Args:
+            texts: List of text strings to process
+            voice: The voice to use for synthesis
+            speed: Single speed or list of speeds (one per text)
+            split_pattern: Pattern to split texts (None to disable)
+            model: Optional KModel instance (uses pipeline's model if not provided)
+        
+        Returns:
+            List of KPipeline.Result objects with audio, phonemes, and timestamps
+        """
+        model = model or self.model
+        if not model:
+            raise ValueError('No model available for batch generation')
+        if voice is None:
+            raise ValueError('Specify a voice: pipeline.generate_batch(..., voice="af_heart")')
+        
+        # Process texts and collect chunks
+        all_chunks = []
+        chunk_to_text = []  # Track which text each chunk belongs to
+        
+        for text_idx, text in enumerate(texts):
+            # Split text if needed
+            segments = re.split(split_pattern, text.strip()) if split_pattern else [text]
+            
+            for segment in segments:
+                if not segment.strip():
+                    continue
+                
+                # Process based on language
+                if self.lang_code in 'ab':
+                    # English processing with tokenization
+                    _, tokens = self.g2p(segment)
+                    for gs, ps, tks in self.en_tokenize(tokens):
+                        if not ps:
+                            continue
+                        if len(ps) > 510:
+                            logger.warning(f"Truncating phoneme sequence: {len(ps)} > 510")
+                            ps = ps[:510]
+                        all_chunks.append((gs, ps, tks, text_idx))
+                        chunk_to_text.append(text_idx)
+                else:
+                    # Non-English processing with chunking
+                    chunk_size = 400
+                    chunks = []
+                    
+                    # Split on sentence boundaries
+                    sentences = re.split(r'([.!?]+)', segment)
+                    current_chunk = ""
+                    
+                    for i in range(0, len(sentences), 2):
+                        sentence = sentences[i]
+                        if i + 1 < len(sentences):
+                            sentence += sentences[i + 1]
+                        
+                        if len(current_chunk) + len(sentence) <= chunk_size:
+                            current_chunk += sentence
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence
+                    
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    
+                    if not chunks:
+                        chunks = [segment[i:i+chunk_size] for i in range(0, len(segment), chunk_size)]
+                    
+                    # Process each chunk
+                    for chunk in chunks:
+                        if not chunk.strip():
+                            continue
+                        ps, _ = self.g2p(chunk)
+                        if not ps:
+                            continue
+                        if len(ps) > 510:
+                            logger.warning(f'Truncating phoneme sequence: {len(ps)} > 510')
+                            ps = ps[:510]
+                        all_chunks.append((chunk, ps, None, text_idx))
+                        chunk_to_text.append(text_idx)
+        
+        if not all_chunks:
+            return []
+        
+        # Prepare batch parameters
+        phonemes_list = [ps for _, ps, _, _ in all_chunks]
+        if isinstance(speed, float):
+            batch_speeds = speed
+        else:
+            batch_speeds = [speed[chunk_to_text[i]] for i in range(len(all_chunks))]
+        
+        input_ids, input_lengths, voice_packs, speeds = self.prepare_batch_params(
+            phonemes_list, voice, batch_speeds
+        )
+        
+        # Run batched inference
+        audio_list, pred_dur_list = model.forward_batch(
+            input_ids, input_lengths, voice_packs, speeds
+        )
+        
+        # Create results with timestamps
+        results = []
+        for i, ((gs, ps, tks, text_idx), audio, pred_dur) in enumerate(zip(all_chunks, audio_list, pred_dur_list)):
+            output = KModel.Output(audio=audio, pred_dur=pred_dur)
+            if tks and pred_dur is not None:
+                KPipeline.join_timestamps(tks, pred_dur)
+            results.append(self.Result(
+                graphemes=gs,
+                phonemes=ps,
+                tokens=tks,
+                output=output,
+                text_index=text_idx
+            ))
+        
+        return results
