@@ -216,30 +216,37 @@ class KModel(torch.nn.Module):
         frame_mask = (frame_indices.squeeze(1).expand(batch_size, -1) >= seq_lengths.unsqueeze(1)).to(device)
         frame_mask = (~frame_mask).float()  # [batch, max_frames]
         
-        # F0 and N prediction - now batched!
-        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
+        # F0 and N prediction - now batched with masking for efficiency!
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s, seq_lengths, frame_mask)
         
         # Decode audio - batched
         audio_batch = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
         
-        # Extract individual audios based on their actual lengths
+        # Calculate audio lengths for all items at once (vectorized, no GPU sync)
+        # The decoder upsamples by a factor, need to calculate actual audio samples
+        audio_lengths = (seq_lengths * (audio_batch.shape[-1] / max_frames)).long()
+        
+        # Move everything to CPU in one go after GPU work is complete
+        audio_batch_cpu = audio_batch.cpu()
+        audio_lengths_cpu = audio_lengths.cpu()
+        pred_dur_cpu = pred_dur.cpu()
+        input_lengths_cpu = input_lengths.cpu()
+        
+        # Now extract individual audios (this is fast, all on CPU)
         audio_list = []
         pred_dur_list = []
         
         for i in range(batch_size):
-            # Calculate actual audio length for this item
-            frame_len = seq_lengths[i].item()
-            # The decoder upsamples by a factor, need to calculate actual audio samples
-            audio_len = int(frame_len * (audio_batch.shape[-1] / max_frames))
+            audio_len = audio_lengths_cpu[i].item()
             
             # Extract audio for this item (trim padding)
             if batch_size == 1:
-                item_audio = audio_batch[:audio_len]
+                item_audio = audio_batch_cpu[:audio_len]
             else:
-                item_audio = audio_batch[i, :audio_len]
+                item_audio = audio_batch_cpu[i, :audio_len]
             
-            audio_list.append(item_audio.cpu())
-            pred_dur_list.append(pred_dur[i, :input_lengths[i]].cpu())
+            audio_list.append(item_audio)
+            pred_dur_list.append(pred_dur_cpu[i, :input_lengths_cpu[i]])
         
         return audio_list, pred_dur_list
 

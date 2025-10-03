@@ -8,6 +8,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def LSTMForward(lstm: nn.LSTM, x, input_lengths):
+    """
+    Efficient LSTM forward pass that skips padded positions.
+    Packs sequences, processes only real frames, then unpacks.
+    """
+    lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
+    x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+    lstm.flatten_parameters()
+    x, _ = lstm(x)
+    x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+    return x, _
+
+
 class LinearNorm(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, w_init_gain='linear'):
         super(LinearNorm, self).__init__()
@@ -121,16 +134,55 @@ class ProsodyPredictor(nn.Module):
         en = (d.transpose(-1, -2) @ alignment)
         return duration.squeeze(-1), en
 
-    def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
+    def F0Ntrain(self, x, s, x_lengths=None, frame_mask=None):
+        """
+        F0 and N prediction with optional masking for batching efficiency.
+        
+        Args:
+            x: Input features [batch, channels, frames]
+            s: Style embedding [batch, style_dim]
+            x_lengths: Optional sequence lengths for LSTM packing
+            frame_mask: Optional mask [batch, frames] to zero out padding
+        """
+        # Use efficient LSTM forward if lengths provided (skips padded frames)
+        if x_lengths is not None:
+            x, _ = LSTMForward(self.shared, x.transpose(-1, -2), x_lengths)
+        else:
+            x, _ = self.shared(x.transpose(-1, -2))
+        
+        # F0 prediction - process without mask through blocks
+        # (blocks may upsample, changing dimensions)
         F0 = x.transpose(-1, -2)
         for block in self.F0:
             F0 = block(F0, s)
         F0 = self.F0_proj(F0)
+        
+        # Apply mask at the end after upsampling
+        if frame_mask is not None:
+            # The F0 blocks upsample by 2x, so we need to upsample the mask too
+            upsampled_mask = torch.nn.functional.interpolate(
+                frame_mask.unsqueeze(1), 
+                size=F0.shape[-1], 
+                mode='nearest'
+            )
+            F0 = F0 * upsampled_mask
+        
+        # N prediction - process without mask through blocks
         N = x.transpose(-1, -2)
         for block in self.N:
             N = block(N, s)
         N = self.N_proj(N)
+        
+        # Apply mask at the end after upsampling
+        if frame_mask is not None:
+            # The N blocks upsample by 2x as well
+            upsampled_mask = torch.nn.functional.interpolate(
+                frame_mask.unsqueeze(1), 
+                size=N.shape[-1], 
+                mode='nearest'
+            )
+            N = N * upsampled_mask
+        
         return F0.squeeze(1), N.squeeze(1)
 
 
