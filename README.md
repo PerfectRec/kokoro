@@ -34,14 +34,13 @@ import soundfile as sf
 # Initialize pipeline
 pipeline = KPipeline(lang_code='a')
 
-# Process multiple texts in batch
+# Basic batching: single voice for all texts
 texts = [
     "Hello, this is the first sentence.",
     "This is the second sentence.",
     "And here's a third one for good measure."
 ]
 
-# Generate audio for all texts efficiently
 results = pipeline.generate_batch(
     texts=texts,
     voice='af_heart',
@@ -67,12 +66,36 @@ for i, result in enumerate(results):
     print(f"From original text index: {result.text_index}")
 ```
 
+**Multi-voice batching** - different voice for each text:
+```py
+# Perfect for dialogue or multi-speaker content
+texts = [
+    "Hello, I'm the narrator.",
+    "And I'm a character in the story.",
+    "I'm another character with a different voice!"
+]
+
+voices = ['af_bella', 'af_nicole', 'af_sky']
+
+results = pipeline.generate_batch(
+    texts=texts,
+    voice=voices,  # List of voices - one per text
+    speed=[1.0, 1.1, 0.9]  # Optional: different speeds too
+)
+
+for i, result in enumerate(results):
+    sf.write(f'speaker_{i}.wav', result.audio, 24000)
+```
+
 **Key features of batched inference:**
-- ✅ 2-5x faster than sequential processing
-- ✅ Preserves all features: word timestamps, multi-language support
-- ✅ Supports variable speeds per text
-- ✅ Tracks original text indices
-- ✅ Works with all languages and voices
+- ✅ **2-5x faster** than sequential processing (especially on GPU)
+- ✅ **Multi-voice support** - different voice per text
+- ✅ **Preserves all features**: word timestamps, multi-language support
+- ✅ **Variable speeds** - per-text speed control
+- ✅ **Automatic chunking** - handles long texts efficiently
+- ✅ **True batching** - fully parallelized GPU inference
+- ✅ **Tracks original text indices** - for chunk mapping
+- ✅ **Works with all languages and voices**
 
 **Alternative batch API for pre-tokenized inputs:**
 ```py
@@ -80,10 +103,10 @@ for i, result in enumerate(results):
 _, tokens1 = pipeline.g2p("First sentence.")
 _, tokens2 = pipeline.g2p("Second sentence.")
 
-# Generate from tokens
+# Generate from tokens (also supports voice lists)
 results = pipeline.generate_from_tokens_batch(
     tokens_list=[tokens1, tokens2],
-    voice='af_heart',
+    voice='af_heart',  # or ['af_bella', 'af_nicole']
     speed=1.0
 )
 ```

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark batching performance with larger text blocks (~300 characters each).
+Comprehensive batching examples for Kokoro TTS.
+
+This script demonstrates:
+1. Basic batching with performance benchmarks
+2. Multi-voice batching (different voices per text)
+3. Variable speeds per text
+4. Batch size comparisons
 """
 
 import time
@@ -111,9 +117,78 @@ def benchmark_batched(pipeline, texts, voice, batch_size, output_dir):
     
     return total_time, all_results
 
+def demo_multi_voice_batching(pipeline, output_dir):
+    """Demonstrate multi-voice and variable speed batching."""
+    print(f"\n{'='*70}")
+    print(f"MULTI-VOICE BATCHING DEMO")
+    print(f"{'='*70}")
+    
+    # Example 1: Different voices for different speakers
+    dialogue_texts = [
+        "Hello, I'm Bella. It's nice to meet you!",
+        "Hi Bella! I'm Nicole, pleasure to meet you too.",
+        "And I'm Sky. Welcome to the demonstration!",
+    ]
+    voices = ['af_bella', 'af_nicole', 'af_sky']
+    
+    print("\nExample 1: Dialogue with different voices")
+    print("Texts with their assigned voices:")
+    for text, voice in zip(dialogue_texts, voices):
+        print(f"  [{voice:12s}] \"{text}\"")
+    
+    start = time.time()
+    results = pipeline.generate_batch(texts=dialogue_texts, voice=voices)
+    elapsed = time.time() - start
+    
+    print(f"\n✓ Generated {len(results)} audio clips in {elapsed:.3f}s")
+    
+    # Save dialogue audio
+    os.makedirs(output_dir, exist_ok=True)
+    for i, (result, voice) in enumerate(zip(results, voices)):
+        filename = os.path.join(output_dir, f"dialogue_{i}_{voice}.wav")
+        save_audio(result.audio, filename)
+        print(f"  Saved: {filename} ({len(result.audio)/24000:.2f}s)")
+    
+    # Example 2: Same text with different voices (comparison)
+    print("\nExample 2: Same text with different voices")
+    comparison_text = "This is a test of the text-to-speech system."
+    comparison_texts = [comparison_text] * 3
+    
+    print(f"Text: \"{comparison_text}\"")
+    print(f"Voices: {voices}")
+    
+    results = pipeline.generate_batch(texts=comparison_texts, voice=voices)
+    
+    for i, (result, voice) in enumerate(zip(results, voices)):
+        filename = os.path.join(output_dir, f"comparison_{voice}.wav")
+        save_audio(result.audio, filename)
+        print(f"  [{voice}]: {filename} ({len(result.audio)/24000:.2f}s)")
+    
+    # Example 3: Different voices AND speeds
+    print("\nExample 3: Different voices with variable speeds")
+    speed_texts = [
+        "Speaking at normal speed.",
+        "This one is faster!",
+        "And this is slower and more deliberate."
+    ]
+    speeds = [1.0, 1.3, 0.8]
+    
+    print("Texts with voices and speeds:")
+    for text, voice, speed in zip(speed_texts, voices, speeds):
+        print(f"  [{voice:12s} @ {speed:.1f}x] \"{text}\"")
+    
+    results = pipeline.generate_batch(texts=speed_texts, voice=voices, speed=speeds)
+    
+    for i, (result, voice, speed) in enumerate(zip(results, voices, speeds)):
+        filename = os.path.join(output_dir, f"speed_{voice}_{speed}x.wav")
+        save_audio(result.audio, filename)
+        print(f"  Saved: {filename} ({len(result.audio)/24000:.2f}s)")
+    
+    print(f"\n✓ Multi-voice demo complete! Audio saved to: {output_dir}/")
+
 def main():
     print("="*70)
-    print("KOKORO TTS BATCHING BENCHMARK - LARGE TEXTS")
+    print("KOKORO TTS BATCHING EXAMPLES & BENCHMARK")
     print("="*70)
     
     # Setup
@@ -123,8 +198,19 @@ def main():
     output_base = 'batching_output'
     
     print(f"Device: {pipeline.model.device}")
-    print(f"Voice: {voice}")
-    print(f"Number of texts: {len(LARGE_TEXTS)}")
+    print(f"Voice (for benchmarks): {voice}")
+    print(f"Number of benchmark texts: {len(LARGE_TEXTS)}")
+    
+    # PART 1: Multi-voice batching demo
+    demo_multi_voice_batching(
+        pipeline, 
+        os.path.join(output_base, 'multi_voice')
+    )
+    
+    # PART 2: Performance benchmarks
+    print("\n" + "="*70)
+    print("PERFORMANCE BENCHMARKS")
+    print("="*70)
     
     # Show text statistics
     char_counts = [len(t) for t in LARGE_TEXTS]

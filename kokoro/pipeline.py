@@ -333,7 +333,7 @@ class KPipeline:
     def prepare_batch_params(
         self,
         phonemes_list: List[str],
-        voice: Union[str, torch.FloatTensor],
+        voice: Union[str, torch.FloatTensor, List[Union[str, torch.FloatTensor]]],
         speed: Union[float, List[float]] = 1.0
     ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.FloatTensor, torch.FloatTensor]:
         """
@@ -341,19 +341,29 @@ class KPipeline:
         
         Args:
             phonemes_list: List of phoneme strings
-            voice: Voice name or voice tensor (will be broadcast to all items)
+            voice: Single voice (broadcasted to all), or list of voices (one per item)
             speed: Single speed or list of speeds (one per item)
         
         Returns:
             Tuple of (input_ids, input_lengths, voice_packs, speeds)
         """
-        pack = self.load_voice(voice).to(self.model.device) if self.model else None
+        batch_size = len(phonemes_list)
+        
+        # Handle voice parameter - single or list
+        if isinstance(voice, list):
+            if len(voice) != batch_size:
+                raise ValueError(f"voice list length ({len(voice)}) must match batch size ({batch_size})")
+            voice_packs_list = [self.load_voice(v).to(self.model.device) if self.model else None for v in voice]
+        else:
+            # Single voice - will be used for all items
+            single_pack = self.load_voice(voice).to(self.model.device) if self.model else None
+            voice_packs_list = [single_pack] * batch_size
         
         # Convert phonemes to input IDs and collect voice embeddings
         input_ids_list = []
         voice_list = []
         
-        for ps in phonemes_list:
+        for ps, pack in zip(phonemes_list, voice_packs_list):
             ids = list(filter(lambda i: i is not None, map(lambda p: self.model.vocab.get(p), ps)))
             input_ids_list.append(torch.LongTensor([0, *ids, 0]))
             # Select voice embedding based on phoneme length (same as original infer method)
@@ -371,7 +381,6 @@ class KPipeline:
         voice_packs = torch.stack(voice_list).to(self.model.device)
         
         # Prepare speeds
-        batch_size = len(phonemes_list)
         if isinstance(speed, (int, float)):
             speeds = torch.FloatTensor([speed] * batch_size)
         else:
@@ -494,7 +503,7 @@ class KPipeline:
     def generate_from_tokens_batch(
         self,
         tokens_list: List[List[en.MToken]],
-        voice: str,
+        voice: Union[str, torch.FloatTensor, List[Union[str, torch.FloatTensor]]],
         speed: Union[float, List[float]] = 1.0,
         model: Optional[KModel] = None
     ) -> List['KPipeline.Result']:
@@ -503,7 +512,7 @@ class KPipeline:
         
         Args:
             tokens_list: List of token lists (one per text)
-            voice: The voice to use for synthesis
+            voice: Single voice (broadcasted to all), or list of voices (one per item)
             speed: Single speed or list of speeds (one per item)
             model: Optional KModel instance (uses pipeline's model if not provided)
         
@@ -535,9 +544,21 @@ class KPipeline:
         
         # Prepare batch parameters
         phonemes_list = [ps for _, ps, _ in all_chunks]
+        
+        # Handle voice parameter - map to chunks
+        if isinstance(voice, list):
+            chunk_voices = [voice[chunk_to_input[i]] for i in range(len(all_chunks))]
+        else:
+            chunk_voices = voice
+        
+        # Handle speed parameter - map to chunks
+        if isinstance(speed, list):
+            chunk_speeds = [speed[chunk_to_input[i]] for i in range(len(all_chunks))]
+        else:
+            chunk_speeds = speed
+        
         input_ids, input_lengths, voice_packs, speeds = self.prepare_batch_params(
-            phonemes_list, voice, speed if isinstance(speed, float) else 
-            [speed[chunk_to_input[i]] for i in range(len(all_chunks))]
+            phonemes_list, chunk_voices, chunk_speeds
         )
         
         # Run batched inference
@@ -564,7 +585,7 @@ class KPipeline:
     def generate_batch(
         self,
         texts: List[str],
-        voice: str,
+        voice: Union[str, torch.FloatTensor, List[Union[str, torch.FloatTensor]]],
         speed: Union[float, List[float]] = 1.0,
         split_pattern: Optional[str] = r'\n+',
         model: Optional[KModel] = None
@@ -574,7 +595,7 @@ class KPipeline:
         
         Args:
             texts: List of text strings to process
-            voice: The voice to use for synthesis
+            voice: Single voice (broadcasted to all), or list of voices (one per text)
             speed: Single speed or list of speeds (one per text)
             split_pattern: Pattern to split texts (None to disable)
             model: Optional KModel instance (uses pipeline's model if not provided)
@@ -587,6 +608,10 @@ class KPipeline:
             raise ValueError('No model available for batch generation')
         if voice is None:
             raise ValueError('Specify a voice: pipeline.generate_batch(..., voice="af_heart")')
+        
+        # Validate voice list length if provided
+        if isinstance(voice, list) and len(voice) != len(texts):
+            raise ValueError(f"voice list length ({len(voice)}) must match texts length ({len(texts)})")
         
         # Process texts and collect chunks
         all_chunks = []
@@ -657,13 +682,21 @@ class KPipeline:
         
         # Prepare batch parameters
         phonemes_list = [ps for _, ps, _, _ in all_chunks]
-        if isinstance(speed, float):
-            batch_speeds = speed
+        
+        # Map voices to chunks
+        if isinstance(voice, list):
+            chunk_voices = [voice[chunk_to_text[i]] for i in range(len(all_chunks))]
         else:
-            batch_speeds = [speed[chunk_to_text[i]] for i in range(len(all_chunks))]
+            chunk_voices = voice
+        
+        # Map speeds to chunks
+        if isinstance(speed, list):
+            chunk_speeds = [speed[chunk_to_text[i]] for i in range(len(all_chunks))]
+        else:
+            chunk_speeds = speed
         
         input_ids, input_lengths, voice_packs, speeds = self.prepare_batch_params(
-            phonemes_list, voice, batch_speeds
+            phonemes_list, chunk_voices, chunk_speeds
         )
         
         # Run batched inference
