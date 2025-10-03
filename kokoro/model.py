@@ -165,62 +165,64 @@ class KModel(torch.nn.Module):
         input_lengths = input_lengths.to(device)
         speeds = speeds.to(device)
         
-        # Create text masks
-        text_mask = torch.arange(input_lengths.max(), device=device).unsqueeze(0).expand(batch_size, -1)
-        text_mask = torch.gt(text_mask + 1, input_lengths.unsqueeze(1)).to(device)
-        
-        # BERT encoding
-        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
-        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
-        
-        # Style processing
-        s = ref_s[:, 128:]
-        
-        # Prosody prediction
-        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = self.predictor.lstm(d)
-        
-        # Duration prediction with speed adjustment
-        attention_mask = (~text_mask).float()
-        duration = self.predictor.duration_proj(x)
-        pred_dur = torch.round(
-            ((torch.sigmoid(duration)).sum(dim=-1).clamp(min=1) * attention_mask) / speeds.unsqueeze(1)
-        ).long()
-        
-        # Calculate sequence lengths after duration expansion
-        seq_lengths = pred_dur.sum(axis=-1)
-        max_frames = seq_lengths.max().item()
-        
-        # Create batched alignment matrices using the kokoro_batch approach
-        # This is the key to true batching - creates all alignments at once
-        frame_indices = torch.arange(max_frames, device=device).view(1, 1, -1)  # [1, 1, max_frames]
-        duration_cumsum = pred_dur.cumsum(dim=1).unsqueeze(-1)  # [batch, seq_len, 1]
-        
-        # Create masks for alignment
-        mask1 = duration_cumsum > frame_indices  # [batch, seq_len, max_frames]
-        mask2 = frame_indices >= torch.cat(
-            [torch.zeros(batch_size, 1, 1, device=device), duration_cumsum[:, :-1, :]],
-            dim=1
-        )  # [batch, seq_len, max_frames]
-        
-        pred_aln_trgs = (mask1 & mask2).float()  # [batch, seq_len, max_frames]
-        
-        # Expand features to frame level using batched alignment - ALL AT ONCE!
-        en = d.transpose(-1, -2) @ pred_aln_trgs  # [batch, channels, max_frames]
-        
-        # Text encoding - batched
-        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
-        asr = t_en @ pred_aln_trgs  # [batch, channels, max_frames]
-        
-        # Create frame mask for padded positions
-        frame_mask = (frame_indices.squeeze(1).expand(batch_size, -1) >= seq_lengths.unsqueeze(1)).to(device)
-        frame_mask = (~frame_mask).float()  # [batch, max_frames]
-        
-        # F0 and N prediction - now batched with masking for efficiency!
-        F0_pred, N_pred = self.predictor.F0Ntrain(en, s, seq_lengths, frame_mask)
-        
-        # Decode audio - batched
-        audio_batch = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
+        autocast_enabled = (device.type == 'cuda')
+        with torch.autocast(device_type='cuda', enabled=autocast_enabled):
+            # Create text masks
+            text_mask = torch.arange(input_lengths.max(), device=device).unsqueeze(0).expand(batch_size, -1)
+            text_mask = torch.gt(text_mask + 1, input_lengths.unsqueeze(1)).to(device)
+
+            # BERT encoding
+            bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
+            d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+
+            # Style processing
+            s = ref_s[:, 128:]
+
+            # Prosody prediction
+            d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+            x, _ = self.predictor.lstm(d)
+
+            # Duration prediction with speed adjustment
+            attention_mask = (~text_mask).float()
+            duration = self.predictor.duration_proj(x)
+            pred_dur = torch.round(
+                ((torch.sigmoid(duration)).sum(dim=-1).clamp(min=1) * attention_mask) / speeds.unsqueeze(1)
+            ).long()
+
+            # Calculate sequence lengths after duration expansion
+            seq_lengths = pred_dur.sum(axis=-1)
+            max_frames = seq_lengths.max().item()
+
+            # Create batched alignment matrices using the kokoro_batch approach
+            # This is the key to true batching - creates all alignments at once
+            frame_indices = torch.arange(max_frames, device=device).view(1, 1, -1)  # [1, 1, max_frames]
+            duration_cumsum = pred_dur.cumsum(dim=1).unsqueeze(-1)  # [batch, seq_len, 1]
+
+            # Create masks for alignment
+            mask1 = duration_cumsum > frame_indices  # [batch, seq_len, max_frames]
+            mask2 = frame_indices >= torch.cat(
+                [torch.zeros(batch_size, 1, 1, device=device), duration_cumsum[:, :-1, :]],
+                dim=1
+            )  # [batch, seq_len, max_frames]
+
+            pred_aln_trgs = (mask1 & mask2).float()  # [batch, seq_len, max_frames]
+
+            # Expand features to frame level using batched alignment - ALL AT ONCE!
+            en = d.transpose(-1, -2) @ pred_aln_trgs  # [batch, channels, max_frames]
+
+            # Text encoding - batched
+            t_en = self.text_encoder(input_ids, input_lengths, text_mask)
+            asr = t_en @ pred_aln_trgs  # [batch, channels, max_frames]
+
+            # Create frame mask for padded positions
+            frame_mask = (frame_indices.squeeze(1).expand(batch_size, -1) >= seq_lengths.unsqueeze(1)).to(device)
+            frame_mask = (~frame_mask).float()  # [batch, max_frames]
+
+            # F0 and N prediction - now batched with masking for efficiency!
+            F0_pred, N_pred = self.predictor.F0Ntrain(en, s, seq_lengths, frame_mask)
+
+            # Decode audio - batched, pass frame_mask for downstream masking
+            audio_batch = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], frame_mask=frame_mask).squeeze()
         
         # Calculate audio lengths for all items at once (vectorized, no GPU sync)
         # The decoder upsamples by a factor, need to calculate actual audio samples

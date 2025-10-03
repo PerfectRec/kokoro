@@ -296,7 +296,7 @@ class Generator(nn.Module):
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
-    def forward(self, x, s, f0):
+    def forward(self, x, s, f0, frame_mask=None):
         with torch.no_grad():
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
             har_source, noi_source, uv = self.m_source(f0)
@@ -322,7 +322,12 @@ class Generator(nn.Module):
         x = self.conv_post(x)
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
-        return self.stft.inverse(spec, phase)
+        audio = self.stft.inverse(spec, phase)
+        if frame_mask is not None:
+            # Zero out padded regions in the final audio by upsampling the frame mask
+            mask_audio = F.interpolate(frame_mask.unsqueeze(1), size=audio.shape[-1], mode='nearest')
+            audio = audio * mask_audio
+        return audio
 
 
 class UpSample1d(nn.Module):
@@ -404,7 +409,14 @@ class Decoder(nn.Module):
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
-    def forward(self, asr, F0_curve, N, s):
+    def forward(self, asr, F0_curve, N, s, frame_mask=None):
+        if frame_mask is not None:
+            # Mask ASR at alignment resolution
+            asr = asr * frame_mask.unsqueeze(1)
+            # Upsample mask to match F0/N temporal length (typically 2x)
+            fm_f0n = F.interpolate(frame_mask.unsqueeze(1), size=F0_curve.shape[-1], mode='nearest').squeeze(1)
+            F0_curve = F0_curve * fm_f0n
+            N = N * fm_f0n
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
         N = self.N_conv(N.unsqueeze(1))
         x = torch.cat([asr, F0, N], axis=1)
@@ -417,5 +429,5 @@ class Decoder(nn.Module):
             x = block(x, s)
             if block.upsample_type != "none":
                 res = False
-        x = self.generator(x, s, F0_curve)
+        x = self.generator(x, s, F0_curve, frame_mask=frame_mask)
         return x
